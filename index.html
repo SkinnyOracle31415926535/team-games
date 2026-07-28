@@ -1049,6 +1049,7 @@
       }
     }
   </style>
+  <link rel="stylesheet" href="team-games-sync.css">
   <!-- Team Games flag icon -->
   <link rel="icon" type="image/png" href="icon-v3.png">
   <link rel="apple-touch-icon" sizes="180x180" href="icon-v3.png">
@@ -1161,9 +1162,8 @@
     </section>
   </main>
 
+  <script src="team-games-storage.js"></script>
   <script>
-    const STORAGE_KEY = "camp-group-randomizer-v1";
-    const SELECTED_CLASS_KEY = "team-games-selected-class-v1";
     const CLASS_CACHE_KEY = "team-games-class-roster-cache-v1";
     const SHARED_ROSTER_API_URL = "https://student-shuffle-shared.ryan-666-mp3.chatgpt.site/api/rosters";
     const SHARED_SYNC_INTERVAL_MS = 15000;
@@ -1264,6 +1264,8 @@
     let sharedRosterSaveInProgress = false;
     let selectedClassKey = "";
     let gameStates = {};
+    let centralTransientActions = 0;
+    let centralPromptActive = false;
 
     function makeId() {
       return String(Date.now()) + "-" + Math.random().toString(36).slice(2, 8);
@@ -1271,6 +1273,57 @@
 
     function setStatus(message) {
       status.textContent = message;
+    }
+
+    function centralConfirmationActive() {
+      return pendingWinnerIndex !== null || pendingUndoWin || pendingResetWins ||
+        pendingRemoveStudentId !== null || pendingRemoveWeekId !== null;
+    }
+
+    function centralEditorActive() {
+      const active = document.activeElement;
+      return Boolean(active && (active.matches("input, select") || active === studentName) &&
+        document.querySelector(".app")?.contains(active));
+    }
+
+    function refreshCentralInteraction() {
+      const gameActive = !gameScreen.classList.contains("screen-hidden");
+      window.TeamGamesStorage.setEditorState({
+        active: centralTransientActions > 0 || centralPromptActive ||
+          centralEditorActive() || centralConfirmationActive() ||
+          gameActive || timerRunning,
+        dirty: Boolean(studentName.value.trim()) || centralPromptActive ||
+          centralConfirmationActive() || gameActive || timerRunning
+      });
+    }
+
+    function beginCentralAction() {
+      centralTransientActions += 1;
+      refreshCentralInteraction();
+    }
+
+    function endCentralAction() {
+      centralTransientActions = Math.max(0, centralTransientActions - 1);
+      refreshCentralInteraction();
+    }
+
+    function beginCentralPrompt() {
+      centralPromptActive = true;
+      refreshCentralInteraction();
+    }
+
+    function endCentralPrompt() {
+      centralPromptActive = false;
+      refreshCentralInteraction();
+    }
+
+    function readCentralPrompt(...args) {
+      beginCentralPrompt();
+      try {
+        return window.prompt(...args);
+      } finally {
+        endCentralPrompt();
+      }
     }
 
     function getAudioContext() {
@@ -1563,28 +1616,25 @@
     }
 
     function saveSelectedClassKey() {
-      try {
-        localStorage.setItem(SELECTED_CLASS_KEY, selectedClassKey);
-      } catch (error) {
-        setStatus("selected class could not be remembered");
-      }
+      return save();
     }
 
     function loadSelectedClassKey() {
-      try {
-        return localStorage.getItem(SELECTED_CLASS_KEY) || "";
-      } catch (error) {
-        return "";
-      }
+      return window.TeamGamesStorage.loadSelectedClassKey("");
     }
 
     function save() {
-      try {
-        if (selectedClassKey) gameStates[selectedClassKey] = captureActiveGameState();
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ version: 2, selectedClassKey, gameStates }));
-      } catch (error) {
+      if (selectedClassKey) gameStates[selectedClassKey] = captureActiveGameState();
+      const pending = window.TeamGamesStorage.saveState({
+        version: 2,
+        selectedClassKey,
+        gameStates
+      });
+      void pending.catch((error) => {
+        console.error("Could not save Team Games data.", error);
         setStatus("local save unavailable");
-      }
+      });
+      return pending;
     }
 
     function normalizeArchiveNames(names) {
@@ -1624,19 +1674,16 @@
     }
 
     function load() {
-      try {
-        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-        if (saved && typeof saved === "object" && saved.version === 2 && saved.gameStates && typeof saved.gameStates === "object") {
-          Object.entries(saved.gameStates).forEach(([key, state]) => {
-            if (typeof key === "string") gameStates[key] = normalizeGameState(state);
-          });
-          selectedClassKey = typeof saved.selectedClassKey === "string" ? saved.selectedClassKey : "";
-        } else if (hasGameData(saved)) {
-          gameStates[LEGACY_CLASS_KEY] = normalizeGameState(saved);
-        }
-      } catch (error) {
-        gameStates = {};
-      }
+      const saved = window.TeamGamesStorage.loadState({
+        version: 2,
+        selectedClassKey: "",
+        gameStates: {}
+      });
+      gameStates = {};
+      Object.entries(saved.gameStates).forEach(([key, state]) => {
+        gameStates[key] = normalizeGameState(state);
+      });
+      selectedClassKey = saved.selectedClassKey;
     }
 
     function renderClassSelect() {
@@ -1667,15 +1714,15 @@
             : "Using the saved roster while Team Games reconnects to the shared classes.";
     }
 
-    function selectClass(key, { announce = true } = {}) {
+    function selectClass(key, { announce = true, persist = true } = {}) {
       const entry = getClassEntries().find((item) => item.key === key);
       if (!entry) return;
 
-      if (selectedClassKey) save();
+      if (selectedClassKey && persist) save();
       selectedClassKey = entry.key;
       if (entry.shared) syncGameStateRoster(entry.key);
       useGameState(gameStates[entry.key] || buildGameStateForClass(entry));
-      saveSelectedClassKey();
+      if (persist) saveSelectedClassKey();
       clearWinningGroupConfirm(false);
       clearRemoveStudentConfirm(false);
       clearUndoWinConfirm(false);
@@ -1716,8 +1763,20 @@
 
     async function loadSharedClassData({ announce = false } = {}) {
       if (sharedRosterSaveInProgress || sharedRosterSaveTimer !== null) return;
+      const rosterHeaders =
+        window.StudentShuffleRosterAuth?.getAuthHeaders?.() ||
+        window.StudentShuffleRosterAuth?.getWriteHeaders?.();
+      if (!rosterHeaders) {
+        sharedRosterReady = false;
+        renderClassSelect();
+        if (announce) setStatus("connect roster access to load shared classes");
+        return;
+      }
       try {
-        const response = await fetch(SHARED_ROSTER_API_URL, { cache: "no-store" });
+        const response = await fetch(SHARED_ROSTER_API_URL, {
+          cache: "no-store",
+          headers: rosterHeaders
+        });
         if (!response.ok) throw new Error("Shared roster request failed");
         const shared = readSharedClassPayload(await response.json());
         if (!shared) throw new Error("Shared roster response is invalid");
@@ -1728,7 +1787,7 @@
         sharedRosterReady = true;
         cacheClassData();
 
-        const wantedKey = selectedClassKey || loadSelectedClassKey() || BUILT_IN_CLASSES[0].key;
+        const wantedKey = loadSelectedClassKey() || selectedClassKey || BUILT_IN_CLASSES[0].key;
         if (!getClassEntries().some((entry) => entry.key === wantedKey)) {
           selectedClassKey = BUILT_IN_CLASSES[0].key;
         } else {
@@ -1803,7 +1862,7 @@
         setStatus("wait for the shared classes to finish loading");
         return;
       }
-      const name = cleanName(window.prompt("New class name") || "");
+      const name = cleanName(readCentralPrompt("New class name") || "");
       if (!name) return;
       if (getClassEntries().some((entry) => entry.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
         setStatus("a class with that name already exists");
@@ -1825,7 +1884,7 @@
         setStatus("only a custom class can be renamed");
         return;
       }
-      const name = cleanName(window.prompt("Class name", entry.name) || "");
+      const name = cleanName(readCentralPrompt("Class name", entry.name) || "");
       if (!name || name === entry.name) return;
       if (getClassEntries().some((item) => item.key !== entry.key && item.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
         setStatus("a class with that name already exists");
@@ -1941,6 +2000,7 @@
       timerEndTime = null;
       if (shouldSave) save();
       renderTimer();
+      refreshCentralInteraction();
     }
 
     function resetTimerState(shouldSave = true) {
@@ -1969,6 +2029,7 @@
       timerInterval = window.setInterval(tickTimer, 250);
       save();
       renderTimer();
+      refreshCentralInteraction();
       playSound("tap");
       setStatus("timer started");
     }
@@ -2173,6 +2234,7 @@
         pendingRemoveTimer = null;
       }
       if (shouldRender) renderStudents();
+      refreshCentralInteraction();
     }
 
     function armRemoveStudentConfirm(student) {
@@ -2186,7 +2248,9 @@
         pendingRemoveStudentId = null;
         renderStudents();
         setStatus("delete cancelled");
+        refreshCentralInteraction();
       }, 5000);
+      refreshCentralInteraction();
     }
 
     function removeStudentFromRoster(student) {
@@ -2322,6 +2386,7 @@
         pendingRemoveWeekTimer = null;
       }
       if (shouldRender) renderWeekArchive();
+      refreshCentralInteraction();
     }
 
     function armRemoveWeekConfirm(entry) {
@@ -2335,7 +2400,9 @@
         pendingRemoveWeekId = null;
         renderWeekArchive();
         setStatus("week delete cancelled");
+        refreshCentralInteraction();
       }, 5000);
+      refreshCentralInteraction();
     }
 
     function removeWeekArchiveEntry(entry) {
@@ -2512,12 +2579,14 @@
     function showHomeScreen() {
       gameScreen.classList.add("screen-hidden");
       homeScreen.classList.remove("screen-hidden");
+      refreshCentralInteraction();
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
 
     function showGameScreen() {
       homeScreen.classList.add("screen-hidden");
       gameScreen.classList.remove("screen-hidden");
+      refreshCentralInteraction();
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
 
@@ -2581,6 +2650,7 @@
         pendingWinnerTimer = null;
       }
       if (shouldRender) renderGameScreen();
+      refreshCentralInteraction();
     }
 
     function armWinningGroupConfirm(index) {
@@ -2594,7 +2664,9 @@
         pendingWinnerIndex = null;
         renderGameScreen();
         setStatus("winner not recorded");
+        refreshCentralInteraction();
       }, 5000);
+      refreshCentralInteraction();
     }
 
     function renderUndoWinButton() {
@@ -2614,6 +2686,7 @@
         pendingUndoTimer = null;
       }
       if (shouldRender) renderUndoWinButton();
+      refreshCentralInteraction();
     }
 
     function armUndoWinConfirm(latest) {
@@ -2627,7 +2700,9 @@
         pendingUndoWin = false;
         renderUndoWinButton();
         setStatus("undo cancelled");
+        refreshCentralInteraction();
       }, 5000);
+      refreshCentralInteraction();
     }
 
     function renderResetWinsButton() {
@@ -2647,6 +2722,7 @@
         pendingResetTimer = null;
       }
       if (shouldRender) renderResetWinsButton();
+      refreshCentralInteraction();
     }
 
     function armResetWinsConfirm() {
@@ -2660,7 +2736,9 @@
         pendingResetWins = false;
         renderResetWinsButton();
         setStatus("reset cancelled");
+        refreshCentralInteraction();
       }, 5000);
+      refreshCentralInteraction();
     }
 
     function confirmWinningGroup(index) {
@@ -2812,6 +2890,67 @@
       setStatus(archivedWeek ? "week " + archivedWeek.weekNumber + " stats saved" : "weekly wins reset");
     }
 
+    function applyRemoteTeamGamesState(event) {
+      if (event.detail?.source === "local") return;
+      const previousSelected = selectedClassKey;
+      const saved = window.TeamGamesStorage.loadState({
+        version: 2,
+        selectedClassKey: "",
+        gameStates: {}
+      });
+      gameStates = {};
+      Object.entries(saved.gameStates).forEach(([key, state]) => {
+        gameStates[key] = normalizeGameState(state);
+      });
+
+      const remoteEntry = getClassEntry(saved.selectedClassKey);
+      const previousEntry = getClassEntry(previousSelected);
+      selectedClassKey = remoteEntry
+        ? remoteEntry.key
+        : (previousEntry?.key || getClassEntries()[0]?.key || "");
+      const selected = getClassEntry();
+      if (selected) {
+        useGameState(gameStates[selected.key] || buildGameStateForClass(selected));
+      }
+      renderClassSelect();
+      render();
+      renderGameScreen();
+      showHomeScreen();
+      setStatus(event.detail?.collection === "preferences"
+        ? "synchronized class loaded"
+        : "synchronized game data loaded");
+    }
+
+    window.addEventListener(
+      window.TeamGamesStorage.changeEvent,
+      applyRemoteTeamGamesState
+    );
+
+    const appRoot = document.querySelector(".app");
+    const beginTransientCentralAction = () => {
+      beginCentralAction();
+      window.setTimeout(endCentralAction, 0);
+    };
+    appRoot.addEventListener("pointerdown", (event) => {
+      if (event.target.closest("button, input, select")) {
+        beginTransientCentralAction();
+      }
+    }, true);
+    appRoot.addEventListener("keydown", (event) => {
+      if ((event.key === "Enter" || event.key === " ") &&
+          event.target.closest("button, input, select")) {
+        beginTransientCentralAction();
+      }
+    }, true);
+    appRoot.addEventListener("focusin", refreshCentralInteraction);
+    appRoot.addEventListener("focusout", () => {
+      window.setTimeout(refreshCentralInteraction, 0);
+    });
+    appRoot.addEventListener("input", refreshCentralInteraction);
+    appRoot.addEventListener("change", () => {
+      window.setTimeout(refreshCentralInteraction, 0);
+    });
+
     addStudentButton.addEventListener("click", () => {
       const added = addStudent(studentName.value, studentRating.value);
       studentName.value = "";
@@ -2869,11 +3008,18 @@
     classData = loadCachedClassData();
     const initialClassKey = selectedClassKey || loadSelectedClassKey() || BUILT_IN_CLASSES[0].key;
     selectedClassKey = "";
-    selectClass(initialClassKey, { announce: false });
+    selectClass(initialClassKey, { announce: false, persist: false });
     setStatus("loading shared class rosters...");
     loadSharedClassData({ announce: true });
     window.setInterval(() => loadSharedClassData(), SHARED_SYNC_INTERVAL_MS);
     window.addEventListener("focus", () => loadSharedClassData());
+    window.addEventListener("student-shuffle-roster-authenticated", () => {
+      void loadSharedClassData({ announce: true });
+    });
+    refreshCentralInteraction();
   </script>
+  <script src="https://ryan-app-sync.ryan-666-mp3.chatgpt.site/ryan-app-sync.js"
+    crossorigin="anonymous"></script>
+  <script src="team-games-sync.js"></script>
 </body>
 </html>
