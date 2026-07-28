@@ -66,6 +66,10 @@ test('central manifest and exact backup exclude the roster cache and response se
     /RAW_BACKUP_KEYS = Object\.freeze\(\[\s*STORAGE_KEYS\.state,\s*STORAGE_KEYS\.selectedClass/);
   assert.match(html, /team-games-storage\.js/);
   assert.match(html, /ryan-app-sync[^"']*\/ryan-app-sync\.js/);
+  const syncClientTag = html.match(
+    /<script[^>]+ryan-app-sync[^>]+><\/script>/,
+  )?.[0] || '';
+  assert.doesNotMatch(syncClientTag, /\bcrossorigin\b/i);
   assert.match(html, /team-games-sync\.js/);
 });
 
