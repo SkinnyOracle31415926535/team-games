@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <script src="https://student-shuffle-shared.ryan-666-mp3.chatgpt.site/roster-auth.js"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Team Games</title>
   <style>
@@ -1752,6 +1753,12 @@
       sharedRosterSaveTimer = null;
       if (!sharedRosterReady || sharedRosterSaveInProgress || !classData) return;
 
+      const rosterHeaders = window.StudentShuffleRosterAuth?.getWriteHeaders?.();
+      if (!rosterHeaders) {
+        setStatus("connect roster editing before changing shared classes");
+        return;
+      }
+
       sharedRosterSaveInProgress = true;
       const snapshot = JSON.stringify(normalizeClassData(classData));
       try {
@@ -1759,11 +1766,16 @@
           method: "PUT",
           cache: "no-store",
           headers: {
+            ...rosterHeaders,
             "Content-Type": "application/json",
             "If-Match": "\"" + sharedRosterRevision + "\""
           },
           body: snapshot
         });
+        if (response.status === 401 || response.status === 403) {
+          setStatus("connect roster editing before changing shared classes");
+          return;
+        }
         if (response.status === 412) {
           sharedRosterSaveInProgress = false;
           setStatus("another browser changed the classes; loading the newest roster");
