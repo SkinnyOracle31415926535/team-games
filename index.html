@@ -117,6 +117,21 @@
       text-shadow: 1px 1px 0 var(--lime-light);
     }
 
+    .class-help {
+      min-height: 38px;
+      display: grid;
+      align-items: center;
+      margin-top: 10px;
+      padding: 7px 9px;
+      color: #000080;
+      background: var(--aqua-light);
+      border: 3px inset var(--aqua);
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1.35;
+    }
+
     .app {
       width: min(1040px, 100%);
       margin: 0 auto;
@@ -1034,10 +1049,10 @@
       }
     }
   </style>
-  <!-- Gymnastics Vault icon -->
-  <link rel="icon" type="image/png" href="icon-v2.png">
-  <link rel="apple-touch-icon" sizes="180x180" href="icon-v2.png">
-  <meta name="theme-color" content="#0b4f32">
+  <!-- Team Games flag icon -->
+  <link rel="icon" type="image/png" href="icon-v3.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="icon-v3.png">
+  <meta name="theme-color" content="#073626">
 </head>
 <body>
   <main class="app" aria-label="Team Games">
@@ -1050,6 +1065,17 @@
     </header>
 
     <div id="homeScreen" class="layout">
+      <section class="panel">
+        <div class="panel-title">class roster</div>
+        <label for="classSelect">class</label>
+        <select id="classSelect" aria-describedby="classHelp"></select>
+        <div class="toolbar">
+          <button id="newClass" type="button">new class</button>
+          <button id="renameClass" type="button" class="secondary">rename</button>
+        </div>
+        <div id="classHelp" class="class-help">Loading shared class rosters...</div>
+      </section>
+
       <section class="panel">
         <div class="panel-title">group setup</div>
         <label for="groupCount">number of groups</label>
@@ -1085,7 +1111,7 @@
       </section>
 
       <section class="panel">
-        <div class="panel-title">students</div>
+        <div class="panel-title">students in class</div>
         <div class="row">
           <div>
             <label for="studentName">name</label>
@@ -1110,7 +1136,7 @@
       </section>
 
       <section class="panel">
-        <div class="panel-title">Roster</div>
+        <div class="panel-title">class roster</div>
         <div id="studentList" class="student-list"></div>
       </section>
     </div>
@@ -1137,6 +1163,33 @@
 
   <script>
     const STORAGE_KEY = "camp-group-randomizer-v1";
+    const SELECTED_CLASS_KEY = "team-games-selected-class-v1";
+    const CLASS_CACHE_KEY = "team-games-class-roster-cache-v1";
+    const SHARED_ROSTER_API_URL = "https://student-shuffle-shared.ryan-666-mp3.chatgpt.site/api/rosters";
+    const SHARED_SYNC_INTERVAL_MS = 15000;
+    const LEGACY_CLASS_KEY = "legacy";
+    const BUILT_IN_CLASSES = [
+      {
+        key: "builtin:level-3-boys",
+        name: "boys level 3",
+        names: ["Fabian Fernandes", "Ethan Grinberg", "Weston Schomaker", "Daniel Shatil", "Ariel Shatil", "Logan Huynh"]
+      },
+      {
+        key: "builtin:boys-nga",
+        name: "boys nga",
+        names: ["Benjamin Bowie Christopher", "Kenneth Chan", "Maxon Edington", "Cody Goodman", "Zayd Lakhani", "Adam Pagsolingan", "Ryan Pagsolingan", "Oliver Rodriguez"]
+      },
+      {
+        key: "builtin:boys-level-4",
+        name: "boys level 4",
+        names: ["Maksim Bychkov", "Jace Jackson", "Aarush Kini", "Owen Lavrich", "Kaleb Jax Muolic", "Uladzislau Samoilenka"]
+      },
+      {
+        key: "builtin:advanced-boys",
+        name: "boys advanced",
+        names: ["Ildar Bekov", "Dominic Chan"]
+      }
+    ];
 
     const studentName = document.getElementById("studentName");
     const studentRating = document.getElementById("studentRating");
@@ -1166,6 +1219,10 @@
     const timerStartButton = document.getElementById("timerStart");
     const timerPauseButton = document.getElementById("timerPause");
     const timerResetButton = document.getElementById("timerReset");
+    const classSelect = document.getElementById("classSelect");
+    const newClassButton = document.getElementById("newClass");
+    const renameClassButton = document.getElementById("renameClass");
+    const classHelp = document.getElementById("classHelp");
 
     const TIMER_PRESETS = [
       { label: "30 sec", seconds: 30 },
@@ -1200,6 +1257,13 @@
     let pendingRemoveTimer = null;
     let pendingRemoveWeekId = null;
     let pendingRemoveWeekTimer = null;
+    let classData = null;
+    let sharedRosterRevision = 0;
+    let sharedRosterReady = false;
+    let sharedRosterSaveTimer = null;
+    let sharedRosterSaveInProgress = false;
+    let selectedClassKey = "";
+    let gameStates = {};
 
     function makeId() {
       return String(Date.now()) + "-" + Math.random().toString(36).slice(2, 8);
@@ -1290,19 +1354,234 @@
       return roster.length > 0 && roster.every((student) => student.rating !== null);
     }
 
+    function normalizeRosterNames(names) {
+      const usedNames = new Set();
+      return (Array.isArray(names) ? names : [])
+        .map((name) => typeof name === "string" ? cleanName(name) : "")
+        .filter((name) => {
+          const key = name.toLocaleLowerCase();
+          if (!key || usedNames.has(key)) return false;
+          usedNames.add(key);
+          return true;
+        });
+    }
+
+    function emptyClassData() {
+      return { version: 2, custom: {}, builtinOverrides: {} };
+    }
+
+    function normalizeClassMap(raw) {
+      const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+      const normalized = {};
+      const names = new Set();
+      Object.entries(source)
+        .map(([name, roster]) => ({ name: cleanName(String(name || "")), roster: normalizeRosterNames(roster) }))
+        .filter((entry) => entry.name)
+        .sort((first, second) => first.name.localeCompare(second.name))
+        .forEach((entry) => {
+          const key = entry.name.toLocaleLowerCase();
+          if (names.has(key)) return;
+          names.add(key);
+          normalized[entry.name] = entry.roster;
+        });
+      return normalized;
+    }
+
+    function normalizeBuiltinOverrides(raw) {
+      const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+      const allowed = new Set(BUILT_IN_CLASSES.map((entry) => entry.key));
+      const normalized = {};
+      Object.entries(source).forEach(([key, roster]) => {
+        if (allowed.has(key)) normalized[key] = normalizeRosterNames(roster);
+      });
+      return normalized;
+    }
+
+    function normalizeClassData(raw) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return emptyClassData();
+      return {
+        version: 2,
+        custom: normalizeClassMap(raw.custom),
+        builtinOverrides: normalizeBuiltinOverrides(raw.builtinOverrides)
+      };
+    }
+
+    function loadCachedClassData() {
+      try {
+        return normalizeClassData(JSON.parse(localStorage.getItem(CLASS_CACHE_KEY) || "null"));
+      } catch (error) {
+        return emptyClassData();
+      }
+    }
+
+    function cacheClassData() {
+      try {
+        localStorage.setItem(CLASS_CACHE_KEY, JSON.stringify(classData));
+      } catch (error) {
+        setStatus("local class cache unavailable");
+      }
+    }
+
+    function getClassEntries() {
+      const source = classData || emptyClassData();
+      const classes = BUILT_IN_CLASSES.map((entry) => ({
+        key: entry.key,
+        name: entry.name,
+        names: normalizeRosterNames(source.builtinOverrides[entry.key] || entry.names),
+        shared: true,
+        builtIn: true
+      }));
+
+      Object.entries(source.custom)
+        .map(([name, names]) => ({
+          key: "custom:" + name,
+          name,
+          names: normalizeRosterNames(names),
+          shared: true,
+          builtIn: false
+        }))
+        .sort((first, second) => first.name.localeCompare(second.name))
+        .forEach((entry) => classes.push(entry));
+
+      if (gameStates[LEGACY_CLASS_KEY] && hasGameData(gameStates[LEGACY_CLASS_KEY])) {
+        classes.push({
+          key: LEGACY_CLASS_KEY,
+          name: "legacy roster",
+          names: normalizeRosterNames(gameStates[LEGACY_CLASS_KEY].students.map((student) => student.name)),
+          shared: false,
+          builtIn: false
+        });
+      }
+
+      return classes;
+    }
+
+    function getClassEntry(key = selectedClassKey) {
+      return getClassEntries().find((entry) => entry.key === key) || null;
+    }
+
+    function makeStudentId(classKey, name) {
+      return classKey + ":" + cleanName(name).toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-");
+    }
+
+    function normalizeStudents(rawStudents, active) {
+      return (Array.isArray(rawStudents) ? rawStudents : [])
+        .filter((student) => student && typeof student.name === "string")
+        .map((student) => ({
+          id: typeof student.id === "string" && student.id ? student.id : makeId(),
+          name: cleanName(student.name),
+          rating: normalizeRating(student.rating),
+          wins: normalizeWins(student.wins),
+          active: active === undefined ? student.active !== false : active
+        }))
+        .filter((student) => student.name);
+    }
+
+    function normalizeGameState(raw) {
+      const saved = raw && typeof raw === "object" ? raw : {};
+      const normalizedStudents = normalizeStudents(saved.students);
+      const normalizedArchivedStudents = normalizeStudents(saved.archivedStudents, false)
+        .filter((student) => !normalizedStudents.some((activeStudent) => activeStudent.id === student.id));
+
+      return {
+        students: normalizedStudents,
+        archivedStudents: normalizedArchivedStudents,
+        groupCount: String(Math.min(12, Math.max(2, Math.round(Number(saved.groupCount) || 2)))),
+        winHistory: Array.isArray(saved.winHistory) ? saved.winHistory.filter((entry) => entry && Array.isArray(entry.memberIds)) : [],
+        redoWinHistory: Array.isArray(saved.redoWinHistory) ? saved.redoWinHistory.filter((entry) => entry && Array.isArray(entry.memberIds)) : [],
+        weekArchive: Array.isArray(saved.weekArchive)
+          ? saved.weekArchive.map((entry, index) => normalizeWeekArchiveEntry(entry, index)).filter(Boolean)
+          : [],
+        groupTallies: Array.isArray(saved.groupTallies) ? saved.groupTallies.map((score) => normalizeWins(score)) : [],
+        timerDuration: normalizeTimerSeconds(saved.timerDuration, 60),
+        timerRemaining: normalizeTimerSeconds(saved.timerRemaining, normalizeTimerSeconds(saved.timerDuration, 60))
+      };
+    }
+
+    function hasGameData(raw) {
+      const state = normalizeGameState(raw);
+      return state.students.length > 0 || state.archivedStudents.length > 0 || state.winHistory.length > 0 || state.redoWinHistory.length > 0 || state.weekArchive.length > 0;
+    }
+
+    function captureActiveGameState() {
+      return {
+        students,
+        archivedStudents,
+        groupCount: groupCountInput.value,
+        winHistory,
+        redoWinHistory,
+        weekArchive,
+        groupTallies,
+        timerDuration,
+        timerRemaining
+      };
+    }
+
+    function useGameState(raw) {
+      const state = normalizeGameState(raw);
+      students = state.students;
+      archivedStudents = state.archivedStudents;
+      groupCountInput.value = state.groupCount;
+      winHistory = state.winHistory;
+      redoWinHistory = state.redoWinHistory;
+      weekArchive = state.weekArchive;
+      groupTallies = state.groupTallies;
+      timerDuration = state.timerDuration;
+      timerRemaining = state.timerRemaining;
+      groups = [];
+      timerRunning = false;
+      timerEndTime = null;
+      clearTimerInterval();
+    }
+
+    function buildGameStateForClass(entry) {
+      const state = normalizeGameState({ groupCount: 2 });
+      state.students = normalizeRosterNames(entry?.names).map((name) => ({
+        id: makeStudentId(entry.key, name),
+        name,
+        rating: null,
+        wins: 0,
+        active: true
+      }));
+      return state;
+    }
+
+    function syncGameStateRoster(key) {
+      const entry = getClassEntry(key);
+      if (!entry || !entry.shared) return;
+
+      const state = normalizeGameState(gameStates[key] || buildGameStateForClass(entry));
+      const knownStudents = [...state.students, ...state.archivedStudents];
+      state.students = normalizeRosterNames(entry.names).map((name) => {
+        const existing = knownStudents.find((student) => student.name.toLocaleLowerCase() === name.toLocaleLowerCase());
+        return existing
+          ? { ...existing, active: true }
+          : { id: makeStudentId(key, name), name, rating: null, wins: 0, active: true };
+      });
+      state.archivedStudents = [];
+      gameStates[key] = state;
+    }
+
+    function saveSelectedClassKey() {
+      try {
+        localStorage.setItem(SELECTED_CLASS_KEY, selectedClassKey);
+      } catch (error) {
+        setStatus("selected class could not be remembered");
+      }
+    }
+
+    function loadSelectedClassKey() {
+      try {
+        return localStorage.getItem(SELECTED_CLASS_KEY) || "";
+      } catch (error) {
+        return "";
+      }
+    }
+
     function save() {
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({
-          students,
-          archivedStudents,
-          groupCount: groupCountInput.value,
-          winHistory,
-          redoWinHistory,
-          weekArchive,
-          groupTallies,
-          timerDuration,
-          timerRemaining
-        }));
+        if (selectedClassKey) gameStates[selectedClassKey] = captureActiveGameState();
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ version: 2, selectedClassKey, gameStates }));
       } catch (error) {
         setStatus("local save unavailable");
       }
@@ -1347,58 +1626,214 @@
     function load() {
       try {
         const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-        if (Array.isArray(saved.students)) {
-          students = saved.students
-            .filter((student) => student && typeof student.name === "string")
-            .map((student) => ({
-              id: student.id || makeId(),
-              name: student.name.trim(),
-              rating: normalizeRating(student.rating),
-              wins: Number.isFinite(Number(student.wins)) ? Number(student.wins) : 0,
-              active: student.active !== false
-            }))
-            .filter((student) => student.name);
+        if (saved && typeof saved === "object" && saved.version === 2 && saved.gameStates && typeof saved.gameStates === "object") {
+          Object.entries(saved.gameStates).forEach(([key, state]) => {
+            if (typeof key === "string") gameStates[key] = normalizeGameState(state);
+          });
+          selectedClassKey = typeof saved.selectedClassKey === "string" ? saved.selectedClassKey : "";
+        } else if (hasGameData(saved)) {
+          gameStates[LEGACY_CLASS_KEY] = normalizeGameState(saved);
         }
-        if (Array.isArray(saved.archivedStudents)) {
-          archivedStudents = saved.archivedStudents
-            .filter((student) => student && typeof student.name === "string")
-            .map((student) => ({
-              id: student.id || makeId(),
-              name: student.name.trim(),
-              rating: normalizeRating(student.rating),
-              wins: Number.isFinite(Number(student.wins)) ? Number(student.wins) : 0,
-              active: false
-            }))
-            .filter((student) => student.name)
-            .filter((student) => !students.some((activeStudent) => activeStudent.id === student.id));
-        }
-        if (saved.groupCount) groupCountInput.value = saved.groupCount;
-        if (Array.isArray(saved.winHistory)) {
-          winHistory = saved.winHistory.filter((entry) => entry && Array.isArray(entry.memberIds));
-        }
-        if (Array.isArray(saved.redoWinHistory)) {
-          redoWinHistory = saved.redoWinHistory.filter((entry) => entry && Array.isArray(entry.memberIds));
-        }
-        if (Array.isArray(saved.weekArchive)) {
-          weekArchive = saved.weekArchive
-            .map((entry, index) => normalizeWeekArchiveEntry(entry, index))
-            .filter(Boolean);
-        }
-        if (Array.isArray(saved.groupTallies)) {
-          groupTallies = saved.groupTallies.map((score) => normalizeWins(score));
-        }
-        timerDuration = normalizeTimerSeconds(saved.timerDuration, 60);
-        timerRemaining = normalizeTimerSeconds(saved.timerRemaining, timerDuration);
       } catch (error) {
-        students = [];
-        archivedStudents = [];
-        winHistory = [];
-        redoWinHistory = [];
-        weekArchive = [];
-        groupTallies = [];
-        timerDuration = 60;
-        timerRemaining = 60;
+        gameStates = {};
       }
+    }
+
+    function renderClassSelect() {
+      const entries = getClassEntries();
+      if (!entries.some((entry) => entry.key === selectedClassKey)) {
+        selectedClassKey = entries[0]?.key || "";
+      }
+
+      classSelect.innerHTML = "";
+      entries.forEach((entry) => {
+        const option = document.createElement("option");
+        option.value = entry.key;
+        option.textContent = entry.name + (entry.key === LEGACY_CLASS_KEY ? " (saved)" : "");
+        option.selected = entry.key === selectedClassKey;
+        classSelect.appendChild(option);
+      });
+
+      const selected = getClassEntry();
+      classSelect.disabled = entries.length === 0;
+      renameClassButton.disabled = !selected || selected.builtIn || !selected.shared;
+      renameClassButton.title = selected?.builtIn ? "Built-in classes keep their verified names" : "";
+      classHelp.textContent = !selected
+        ? "No class roster is available."
+        : selected.key === LEGACY_CLASS_KEY
+          ? "This keeps your previous Team Games scores and roster separate from the shared classes."
+          : sharedRosterReady
+            ? "Synced with Student Shuffle. Add or remove names here to update this class everywhere."
+            : "Using the saved roster while Team Games reconnects to the shared classes.";
+    }
+
+    function selectClass(key, { announce = true } = {}) {
+      const entry = getClassEntries().find((item) => item.key === key);
+      if (!entry) return;
+
+      if (selectedClassKey) save();
+      selectedClassKey = entry.key;
+      if (entry.shared) syncGameStateRoster(entry.key);
+      useGameState(gameStates[entry.key] || buildGameStateForClass(entry));
+      saveSelectedClassKey();
+      clearWinningGroupConfirm(false);
+      clearRemoveStudentConfirm(false);
+      clearUndoWinConfirm(false);
+      clearResetWinsConfirm(false);
+      renderClassSelect();
+      render();
+      if (announce) setStatus(entry.name + " class loaded");
+    }
+
+    function activeClassCanSync() {
+      const entry = getClassEntry();
+      return Boolean(entry?.shared && classData);
+    }
+
+    function scheduleSharedClassSave() {
+      if (!sharedRosterReady || !classData) return;
+      if (sharedRosterSaveTimer !== null) window.clearTimeout(sharedRosterSaveTimer);
+      sharedRosterSaveTimer = window.setTimeout(syncSharedClassData, 350);
+    }
+
+    function saveActiveClassRoster() {
+      if (!activeClassCanSync()) return;
+      const entry = getClassEntry();
+      const names = normalizeRosterNames(students.map((student) => student.name));
+      if (entry.builtIn) {
+        classData.builtinOverrides[entry.key] = names;
+      } else {
+        classData.custom[entry.name] = names;
+      }
+      cacheClassData();
+      scheduleSharedClassSave();
+    }
+
+    function readSharedClassPayload(payload) {
+      if (!payload || typeof payload !== "object" || !payload.state || !Number.isInteger(payload.revision) || payload.revision < 1) return null;
+      return { classData: normalizeClassData(payload.state), revision: payload.revision };
+    }
+
+    async function loadSharedClassData({ announce = false } = {}) {
+      if (sharedRosterSaveInProgress || sharedRosterSaveTimer !== null) return;
+      try {
+        const response = await fetch(SHARED_ROSTER_API_URL, { cache: "no-store" });
+        if (!response.ok) throw new Error("Shared roster request failed");
+        const shared = readSharedClassPayload(await response.json());
+        if (!shared) throw new Error("Shared roster response is invalid");
+
+        const changed = !sharedRosterReady || sharedRosterRevision !== shared.revision;
+        classData = shared.classData;
+        sharedRosterRevision = shared.revision;
+        sharedRosterReady = true;
+        cacheClassData();
+
+        const wantedKey = selectedClassKey || loadSelectedClassKey() || BUILT_IN_CLASSES[0].key;
+        if (!getClassEntries().some((entry) => entry.key === wantedKey)) {
+          selectedClassKey = BUILT_IN_CLASSES[0].key;
+        } else {
+          selectedClassKey = wantedKey;
+        }
+        if (changed && selectedClassKey !== LEGACY_CLASS_KEY) {
+          syncGameStateRoster(selectedClassKey);
+          useGameState(gameStates[selectedClassKey] || buildGameStateForClass(getClassEntry(selectedClassKey)));
+          save();
+        }
+        renderClassSelect();
+        render();
+        if (announce) setStatus("shared class rosters loaded");
+      } catch (error) {
+        sharedRosterReady = false;
+        renderClassSelect();
+        if (announce) setStatus("shared rosters unavailable; using saved classes");
+      }
+    }
+
+    async function syncSharedClassData() {
+      sharedRosterSaveTimer = null;
+      if (!sharedRosterReady || sharedRosterSaveInProgress || !classData) return;
+
+      sharedRosterSaveInProgress = true;
+      const snapshot = JSON.stringify(normalizeClassData(classData));
+      try {
+        const response = await fetch(SHARED_ROSTER_API_URL, {
+          method: "PUT",
+          cache: "no-store",
+          headers: {
+            "Content-Type": "application/json",
+            "If-Match": "\"" + sharedRosterRevision + "\""
+          },
+          body: snapshot
+        });
+        if (response.status === 412) {
+          sharedRosterSaveInProgress = false;
+          setStatus("another browser changed the classes; loading the newest roster");
+          await loadSharedClassData({ announce: false });
+          return;
+        }
+        if (!response.ok) throw new Error("Shared roster save failed");
+        const shared = readSharedClassPayload(await response.json());
+        if (!shared) throw new Error("Shared roster save response is invalid");
+        sharedRosterRevision = shared.revision;
+        classData = shared.classData;
+        cacheClassData();
+        renderClassSelect();
+        setStatus("class roster saved for every browser");
+      } catch (error) {
+        setStatus("shared class save failed; retrying when the app reconnects");
+        sharedRosterSaveTimer = window.setTimeout(syncSharedClassData, 5000);
+      } finally {
+        sharedRosterSaveInProgress = false;
+      }
+    }
+
+    function createClass() {
+      if (!sharedRosterReady) {
+        setStatus("wait for the shared classes to finish loading");
+        return;
+      }
+      const name = cleanName(window.prompt("New class name") || "");
+      if (!name) return;
+      if (getClassEntries().some((entry) => entry.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+        setStatus("a class with that name already exists");
+        return;
+      }
+      classData.custom[name] = [];
+      cacheClassData();
+      const key = "custom:" + name;
+      gameStates[key] = buildGameStateForClass({ key, names: [] });
+      scheduleSharedClassSave();
+      selectClass(key, { announce: false });
+      playSound("add");
+      setStatus(name + " class created");
+    }
+
+    function renameSelectedClass() {
+      const entry = getClassEntry();
+      if (!entry || entry.builtIn || !entry.shared) {
+        setStatus("only a custom class can be renamed");
+        return;
+      }
+      const name = cleanName(window.prompt("Class name", entry.name) || "");
+      if (!name || name === entry.name) return;
+      if (getClassEntries().some((item) => item.key !== entry.key && item.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+        setStatus("a class with that name already exists");
+        return;
+      }
+      const nextKey = "custom:" + name;
+      classData.custom[name] = classData.custom[entry.name] || normalizeRosterNames(students.map((student) => student.name));
+      delete classData.custom[entry.name];
+      if (gameStates[entry.key]) {
+        gameStates[nextKey] = gameStates[entry.key];
+        delete gameStates[entry.key];
+      }
+      selectedClassKey = nextKey;
+      cacheClassData();
+      save();
+      scheduleSharedClassSave();
+      selectClass(nextKey, { announce: false });
+      playSound("tap");
+      setStatus(name + " class renamed");
     }
 
     function shuffle(items) {
@@ -1754,6 +2189,7 @@
       students = students.filter((item) => item.id !== student.id);
       groups = [];
       save();
+      saveActiveClassRoster();
       render();
       playSound("remove");
       setStatus(student.name + " deleted from roster and leaderboard");
@@ -2370,6 +2806,7 @@
       studentName.value = "";
       studentName.focus();
       save();
+      saveActiveClassRoster();
       render();
       playSound(added ? "add" : "error");
       setStatus(added ? "student added" : "student already existed");
@@ -2382,6 +2819,7 @@
     sortStudentsButton.addEventListener("click", () => {
       students.sort((a, b) => a.name.localeCompare(b.name));
       save();
+      saveActiveClassRoster();
       render();
       playSound("tap");
       setStatus("students sorted");
@@ -2394,6 +2832,9 @@
       playSound("tap");
     });
 
+    classSelect.addEventListener("change", () => selectClass(classSelect.value));
+    newClassButton.addEventListener("click", createClass);
+    renameClassButton.addEventListener("click", renameSelectedClass);
     generateGroupsButton.addEventListener("click", generateFairGroups);
     timerStartButton.addEventListener("click", startTimer);
     timerPauseButton.addEventListener("click", pauseTimer);
@@ -2414,10 +2855,14 @@
     });
 
     load();
-    if (!students.length) {
-      ["Logan", "Weston", "Danny", "Ethan", "Fabian", "Ari"].forEach((name) => addStudent(name, "na"));
-    }
-    render();
+    classData = loadCachedClassData();
+    const initialClassKey = selectedClassKey || loadSelectedClassKey() || BUILT_IN_CLASSES[0].key;
+    selectedClassKey = "";
+    selectClass(initialClassKey, { announce: false });
+    setStatus("loading shared class rosters...");
+    loadSharedClassData({ announce: true });
+    window.setInterval(() => loadSharedClassData(), SHARED_SYNC_INTERVAL_MS);
+    window.addEventListener("focus", () => loadSharedClassData());
   </script>
 </body>
 </html>
