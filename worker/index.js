@@ -4,6 +4,12 @@ const COLLECTION_RULES = Object.freeze({
   preferences: Object.freeze({ fixedIds: new Set(["current"]) }),
   "game-states": Object.freeze({ pattern: /^game-[a-f0-9]{64}$/ }),
 });
+const LEGACY_COLLECTION = "browser-storage";
+const LEGACY_RECORD_IDS = Object.freeze([
+  "camp-group-randomizer-v1",
+  "team-games-selected-class-v1",
+  "team-games-class-roster-cache-v1",
+]);
 const MAX_BODY_BYTES = 1_200_000;
 const MAX_VALUE_BYTES = 900 * 1024;
 const MAX_DEPTH = 48;
@@ -106,6 +112,34 @@ function validateSyncValue(value) {
   return byteLength(serialized) <= MAX_VALUE_BYTES ? value : null;
 }
 
+function validateLegacyBrowserStorageValue(value) {
+  if (!exactKeys(value, ["present", "encoding", "value"])
+    || typeof value.present !== "boolean"
+    || !["json", "text"].includes(value.encoding)) return null;
+  if (!value.present) return value.encoding === "text" && value.value === null ? value : null;
+  if (value.encoding === "text") {
+    return typeof value.value === "string" && byteLength(value.value) <= MAX_VALUE_BYTES ? value : null;
+  }
+  if (!safeJson(value.value)) return null;
+  const serialized = JSON.stringify(value.value);
+  return byteLength(serialized) <= MAX_VALUE_BYTES ? value : null;
+}
+
+function parseLegacyStoredRow(row) {
+  try {
+    const value = validateLegacyBrowserStorageValue(JSON.parse(row.payload_json));
+    if (!value) return null;
+    return {
+      recordId: row.record_id,
+      revision: row.revision,
+      value,
+      updatedAt: row.updated_at,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function readBody(request) {
   const contentType = request.headers.get("content-type")?.toLowerCase() || "";
   if (!contentType.startsWith("application/json")) return { error: "Use JSON for private sync.", status: 415 };
@@ -141,6 +175,21 @@ async function handleGet(request, database, owner) {
   const records = result.results.map(parseStoredRow);
   if (records.some((record) => record === null)) return json({ error: "A stored sync record needs review." }, 500);
   return json({ version: 1, appId: APP_ID, records });
+}
+
+async function handleLegacyBrowserStorageGet(request, database, owner) {
+  const url = new URL(request.url);
+  if (url.searchParams.get("appId") !== APP_ID) return json({ error: "This recovery request targets the wrong app." }, 400);
+  const placeholders = LEGACY_RECORD_IDS.map(() => "?").join(", ");
+  const result = await database.prepare(`SELECT record_id, revision, payload_json, updated_at
+    FROM app_sync_records
+    WHERE owner_id = ? AND app_id = ? AND collection_name = ? AND record_id IN (${placeholders})
+    ORDER BY record_id COLLATE NOCASE`)
+    .bind(owner, APP_ID, LEGACY_COLLECTION, ...LEGACY_RECORD_IDS)
+    .all();
+  const records = result.results.map(parseLegacyStoredRow);
+  if (records.some((record) => record === null)) return json({ error: "A saved v3 recovery record needs review." }, 500);
+  return json({ version: 1, kind: "ryan_v3_browser_storage_recovery", appId: APP_ID, records });
 }
 
 async function handlePut(request, database, owner) {
@@ -187,6 +236,10 @@ async function api(request, env) {
   if (!owner) return json({ error: "Sign in with the owner ChatGPT account to use private sync." }, 401);
   try {
     await ensureSchema(env.DB);
+    if (new URL(request.url).pathname === "/api/legacy-v3-browser-storage") {
+      if (request.method !== "GET") return json({ error: "Use GET for v3 recovery." }, 405);
+      return await handleLegacyBrowserStorageGet(request, env.DB, owner);
+    }
     if (request.method === "GET") return await handleGet(request, env.DB, owner);
     if (request.method === "PUT") return await handlePut(request, env.DB, owner);
     return json({ error: "Use GET or PUT for private sync." }, 405);
@@ -198,7 +251,7 @@ async function api(request, env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === "/api/app-sync") return api(request, env);
+    if (url.pathname === "/api/app-sync" || url.pathname === "/api/legacy-v3-browser-storage") return api(request, env);
     return env.ASSETS.fetch(request);
   },
 };

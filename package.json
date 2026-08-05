@@ -4,6 +4,6 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --check temporary-data-transfer.js && node --check semantic-app-sync.js && node --check worker/index.js && node --test tests/temporary-data-transfer.test.cjs && npm run build"
+    "test": "node --check temporary-data-transfer.js && node --check semantic-app-sync.js && node --check legacy-v3-recovery.js && node --check worker/index.js && node --test tests/temporary-data-transfer.test.cjs && npm run build"
   }
 }
