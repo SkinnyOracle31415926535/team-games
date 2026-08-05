@@ -4,6 +4,12 @@
   <meta charset="utf-8">
   <script src="https://student-shuffle-shared.ryan-666-mp3.chatgpt.site/roster-auth.js"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#00b050">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Team Games">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
   <title>Team Games</title>
   <style>
     * {
@@ -3016,6 +3022,18 @@
       void loadSharedClassData({ announce: true });
     });
     refreshCentralInteraction();
+  </script>
+  <script src="temporary-data-transfer.js"></script>
+  <script>
+    window.TemporaryDataTransfer.install({
+      appId: "team-games",
+      appName: "Team Games",
+      storageKeys: [
+        "camp-group-randomizer-v1",
+        "team-games-selected-class-v1",
+        "team-games-class-roster-cache-v1"
+      ]
+    });
   </script>
 </body>
 </html>
