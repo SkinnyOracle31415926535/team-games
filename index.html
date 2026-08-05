@@ -3023,6 +3023,7 @@
     });
     refreshCentralInteraction();
   </script>
+  <script src="semantic-app-sync.js"></script>
   <script src="temporary-data-transfer.js"></script>
   <script>
     window.TemporaryDataTransfer.install({
@@ -3032,7 +3033,13 @@
         "camp-group-randomizer-v1",
         "team-games-selected-class-v1",
         "team-games-class-roster-cache-v1"
-      ]
+      ],
+      disableRawSync: true
+    });
+    window.SemanticAppSync.install({
+      appId: "team-games",
+      appName: "Team Games",
+      storage: window.TeamGamesStorage
     });
   </script>
 </body>

@@ -1,6 +1,9 @@
 /* Owner-only, same-origin record sync for the temporary migration period. */
 const APP_ID = "team-games";
-const COLLECTION = "browser-storage";
+const COLLECTION_RULES = Object.freeze({
+  preferences: Object.freeze({ fixedIds: new Set(["current"]) }),
+  "game-states": Object.freeze({ pattern: /^game-[a-f0-9]{64}$/ }),
+});
 const MAX_BODY_BYTES = 1_200_000;
 const MAX_VALUE_BYTES = 900 * 1024;
 const MAX_DEPTH = 48;
@@ -71,11 +74,18 @@ function validRecordId(value) {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,239}$/.test(value);
 }
 
+function validCollectionRecord(collection, recordId) {
+  const rule = COLLECTION_RULES[collection];
+  if (!rule || !validRecordId(recordId)) return false;
+  return rule.fixedIds ? rule.fixedIds.has(recordId) : rule.pattern.test(recordId);
+}
+
 function parseStoredRow(row) {
   try {
     const value = JSON.parse(row.payload_json);
     if (!safeJson(value)) return null;
     return {
+      collection: row.collection_name,
       recordId: row.record_id,
       revision: row.revision,
       value,
@@ -87,15 +97,12 @@ function parseStoredRow(row) {
 }
 
 function validateSyncValue(value) {
-  if (!exactKeys(value, ["present", "encoding", "value"])
-    || typeof value.present !== "boolean"
-    || !["json", "text"].includes(value.encoding)) return null;
-  if (!value.present) return value.encoding === "text" && value.value === null ? value : null;
-  if (value.encoding === "text") {
-    return typeof value.value === "string" && byteLength(value.value) <= MAX_VALUE_BYTES ? value : null;
-  }
-  if (!safeJson(value.value)) return null;
-  const serialized = JSON.stringify(value.value);
+  if (!exactKeys(value, ["schemaVersion", "deleted", "data"])
+    || !Number.isSafeInteger(value.schemaVersion) || value.schemaVersion < 1 || value.schemaVersion > 100
+    || typeof value.deleted !== "boolean") return null;
+  if (value.deleted) return value.data === null ? value : null;
+  if (!safeJson(value.data)) return null;
+  const serialized = JSON.stringify(value.data);
   return byteLength(serialized) <= MAX_VALUE_BYTES ? value : null;
 }
 
@@ -111,11 +118,11 @@ async function readBody(request) {
   }
 }
 
-async function currentRecord(database, owner, recordId) {
-  const result = await database.prepare(`SELECT record_id, revision, payload_json, updated_at
+async function currentRecord(database, owner, collection, recordId) {
+  const result = await database.prepare(`SELECT collection_name, record_id, revision, payload_json, updated_at
     FROM app_sync_records
     WHERE owner_id = ? AND app_id = ? AND collection_name = ? AND record_id = ?`)
-    .bind(owner, APP_ID, COLLECTION, recordId)
+    .bind(owner, APP_ID, collection, recordId)
     .first();
   return result ? parseStoredRow(result) : null;
 }
@@ -123,15 +130,17 @@ async function currentRecord(database, owner, recordId) {
 async function handleGet(request, database, owner) {
   const url = new URL(request.url);
   if (url.searchParams.get("appId") !== APP_ID) return json({ error: "This sync request targets the wrong app." }, 400);
-  const result = await database.prepare(`SELECT record_id, revision, payload_json, updated_at
+  const collections = Object.keys(COLLECTION_RULES);
+  const placeholders = collections.map(() => "?").join(", ");
+  const result = await database.prepare(`SELECT collection_name, record_id, revision, payload_json, updated_at
     FROM app_sync_records
-    WHERE owner_id = ? AND app_id = ? AND collection_name = ?
-    ORDER BY record_id COLLATE NOCASE`)
-    .bind(owner, APP_ID, COLLECTION)
+    WHERE owner_id = ? AND app_id = ? AND collection_name IN (${placeholders})
+    ORDER BY collection_name COLLATE NOCASE, record_id COLLATE NOCASE`)
+    .bind(owner, APP_ID, ...collections)
     .all();
   const records = result.results.map(parseStoredRow);
   if (records.some((record) => record === null)) return json({ error: "A stored sync record needs review." }, 500);
-  return json({ version: 1, appId: APP_ID, collection: COLLECTION, records });
+  return json({ version: 1, appId: APP_ID, records });
 }
 
 async function handlePut(request, database, owner) {
@@ -142,8 +151,7 @@ async function handlePut(request, database, owner) {
   if (!exactKeys(value, ["version", "appId", "collection", "recordId", "expectedRevision", "value"])
     || value.version !== 1
     || value.appId !== APP_ID
-    || value.collection !== COLLECTION
-    || !validRecordId(value.recordId)
+    || !validCollectionRecord(value.collection, value.recordId)
     || !(value.expectedRevision === null || (Number.isSafeInteger(value.expectedRevision) && value.expectedRevision > 0))) {
     return json({ error: "This private sync record has an unsupported schema." }, 400);
   }
@@ -157,18 +165,18 @@ async function handlePut(request, database, owner) {
       (owner_id, app_id, collection_name, record_id, revision, payload_json, created_at, updated_at)
       VALUES (?, ?, ?, ?, 1, ?, ?, ?)
       ON CONFLICT(owner_id, app_id, collection_name, record_id) DO NOTHING`)
-      .bind(owner, APP_ID, COLLECTION, value.recordId, payload, timestamp, timestamp).run();
+      .bind(owner, APP_ID, value.collection, value.recordId, payload, timestamp, timestamp).run();
   } else {
     result = await database.prepare(`UPDATE app_sync_records
       SET revision = revision + 1, payload_json = ?, updated_at = ?
       WHERE owner_id = ? AND app_id = ? AND collection_name = ? AND record_id = ? AND revision = ?`)
-      .bind(payload, timestamp, owner, APP_ID, COLLECTION, value.recordId, value.expectedRevision).run();
+      .bind(payload, timestamp, owner, APP_ID, value.collection, value.recordId, value.expectedRevision).run();
   }
   if (!result.meta.changes) {
-    const current = await currentRecord(database, owner, value.recordId);
+    const current = await currentRecord(database, owner, value.collection, value.recordId);
     return json({ error: "A newer synchronized copy needs review.", current }, 409);
   }
-  const record = await currentRecord(database, owner, value.recordId);
+  const record = await currentRecord(database, owner, value.collection, value.recordId);
   if (!record) return json({ error: "The synchronized record could not be verified." }, 503);
   return json({ record });
 }

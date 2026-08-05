@@ -658,12 +658,13 @@
       appId: options.appId,
       appName: options.appName,
       storageKeys: options.storageKeys.slice(),
+      disableRawSync: options.disableRawSync === true,
       validate: (records) => validateByApp(options.appId, records),
     };
     const mount = () => {
       if (document.querySelector(".ryan-transfer-open")) return;
       const ui = makeUi(normalized);
-      if (syncSupported()) {
+      if (syncSupported() && !normalized.disableRawSync) {
         ui.enableSync();
         if (readSyncState(normalized).enabled) {
           void syncRecords(normalized, ui, false);
