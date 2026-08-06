@@ -3021,32 +3021,11 @@
     refreshCentralInteraction();
   </script>
   <script src="semantic-app-sync.js"></script>
-  <script src="temporary-data-transfer.js"></script>
-  <script src="legacy-v3-recovery.js"></script>
   <script>
-    window.TemporaryDataTransfer.install({
-      appId: "team-games",
-      appName: "Team Games",
-      storageKeys: [
-        "camp-group-randomizer-v1",
-        "team-games-selected-class-v1",
-        "team-games-class-roster-cache-v1"
-      ],
-      disableRawSync: true
-    });
     window.SemanticAppSync.install({
       appId: "team-games",
       appName: "Team Games",
       storage: window.TeamGamesStorage
-    });
-    window.LegacyV3Recovery.install({
-      appId: "team-games",
-      appName: "Team Games",
-      storageKeys: [
-        "camp-group-randomizer-v1",
-        "team-games-selected-class-v1",
-        "team-games-class-roster-cache-v1"
-      ]
     });
   </script>
   <script src="transfer-theme.js"></script>

@@ -1,4 +1,4 @@
-/* Owner-only semantic record sync used during the private Sites migration. */
+/* Owner-only semantic record sync for private ChatGPT Sites. */
 (() => {
   'use strict';
 
