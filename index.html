@@ -1266,8 +1266,6 @@
     let sharedRosterSaveInProgress = false;
     let selectedClassKey = "";
     let gameStates = {};
-    let centralTransientActions = 0;
-    let centralPromptActive = false;
 
     function makeId() {
       return String(Date.now()) + "-" + Math.random().toString(36).slice(2, 8);
@@ -1277,55 +1275,8 @@
       status.textContent = message;
     }
 
-    function centralConfirmationActive() {
-      return pendingWinnerIndex !== null || pendingUndoWin || pendingResetWins ||
-        pendingRemoveStudentId !== null || pendingRemoveWeekId !== null;
-    }
-
-    function centralEditorActive() {
-      const active = document.activeElement;
-      return Boolean(active && (active.matches("input, select") || active === studentName) &&
-        document.querySelector(".app")?.contains(active));
-    }
-
-    function refreshCentralInteraction() {
-      const gameActive = !gameScreen.classList.contains("screen-hidden");
-      window.TeamGamesStorage.setEditorState({
-        active: centralTransientActions > 0 || centralPromptActive ||
-          centralEditorActive() || centralConfirmationActive() ||
-          gameActive || timerRunning,
-        dirty: Boolean(studentName.value.trim()) || centralPromptActive ||
-          centralConfirmationActive() || gameActive || timerRunning
-      });
-    }
-
-    function beginCentralAction() {
-      centralTransientActions += 1;
-      refreshCentralInteraction();
-    }
-
-    function endCentralAction() {
-      centralTransientActions = Math.max(0, centralTransientActions - 1);
-      refreshCentralInteraction();
-    }
-
-    function beginCentralPrompt() {
-      centralPromptActive = true;
-      refreshCentralInteraction();
-    }
-
-    function endCentralPrompt() {
-      centralPromptActive = false;
-      refreshCentralInteraction();
-    }
-
     function readCentralPrompt(...args) {
-      beginCentralPrompt();
-      try {
-        return window.prompt(...args);
-      } finally {
-        endCentralPrompt();
-      }
+      return window.prompt(...args);
     }
 
     function getAudioContext() {
@@ -2002,7 +1953,6 @@
       timerEndTime = null;
       if (shouldSave) save();
       renderTimer();
-      refreshCentralInteraction();
     }
 
     function resetTimerState(shouldSave = true) {
@@ -2031,7 +1981,6 @@
       timerInterval = window.setInterval(tickTimer, 250);
       save();
       renderTimer();
-      refreshCentralInteraction();
       playSound("tap");
       setStatus("timer started");
     }
@@ -2236,7 +2185,6 @@
         pendingRemoveTimer = null;
       }
       if (shouldRender) renderStudents();
-      refreshCentralInteraction();
     }
 
     function armRemoveStudentConfirm(student) {
@@ -2250,9 +2198,7 @@
         pendingRemoveStudentId = null;
         renderStudents();
         setStatus("delete cancelled");
-        refreshCentralInteraction();
       }, 5000);
-      refreshCentralInteraction();
     }
 
     function removeStudentFromRoster(student) {
@@ -2388,7 +2334,6 @@
         pendingRemoveWeekTimer = null;
       }
       if (shouldRender) renderWeekArchive();
-      refreshCentralInteraction();
     }
 
     function armRemoveWeekConfirm(entry) {
@@ -2402,9 +2347,7 @@
         pendingRemoveWeekId = null;
         renderWeekArchive();
         setStatus("week delete cancelled");
-        refreshCentralInteraction();
       }, 5000);
-      refreshCentralInteraction();
     }
 
     function removeWeekArchiveEntry(entry) {
@@ -2581,14 +2524,12 @@
     function showHomeScreen() {
       gameScreen.classList.add("screen-hidden");
       homeScreen.classList.remove("screen-hidden");
-      refreshCentralInteraction();
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
 
     function showGameScreen() {
       homeScreen.classList.add("screen-hidden");
       gameScreen.classList.remove("screen-hidden");
-      refreshCentralInteraction();
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
 
@@ -2652,7 +2593,6 @@
         pendingWinnerTimer = null;
       }
       if (shouldRender) renderGameScreen();
-      refreshCentralInteraction();
     }
 
     function armWinningGroupConfirm(index) {
@@ -2666,9 +2606,7 @@
         pendingWinnerIndex = null;
         renderGameScreen();
         setStatus("winner not recorded");
-        refreshCentralInteraction();
       }, 5000);
-      refreshCentralInteraction();
     }
 
     function renderUndoWinButton() {
@@ -2688,7 +2626,6 @@
         pendingUndoTimer = null;
       }
       if (shouldRender) renderUndoWinButton();
-      refreshCentralInteraction();
     }
 
     function armUndoWinConfirm(latest) {
@@ -2702,9 +2639,7 @@
         pendingUndoWin = false;
         renderUndoWinButton();
         setStatus("undo cancelled");
-        refreshCentralInteraction();
       }, 5000);
-      refreshCentralInteraction();
     }
 
     function renderResetWinsButton() {
@@ -2724,7 +2659,6 @@
         pendingResetTimer = null;
       }
       if (shouldRender) renderResetWinsButton();
-      refreshCentralInteraction();
     }
 
     function armResetWinsConfirm() {
@@ -2738,9 +2672,7 @@
         pendingResetWins = false;
         renderResetWinsButton();
         setStatus("reset cancelled");
-        refreshCentralInteraction();
       }, 5000);
-      refreshCentralInteraction();
     }
 
     function confirmWinningGroup(index) {
@@ -2892,67 +2824,6 @@
       setStatus(archivedWeek ? "week " + archivedWeek.weekNumber + " stats saved" : "weekly wins reset");
     }
 
-    function applyRemoteTeamGamesState(event) {
-      if (event.detail?.source === "local") return;
-      const previousSelected = selectedClassKey;
-      const saved = window.TeamGamesStorage.loadState({
-        version: 2,
-        selectedClassKey: "",
-        gameStates: {}
-      });
-      gameStates = {};
-      Object.entries(saved.gameStates).forEach(([key, state]) => {
-        gameStates[key] = normalizeGameState(state);
-      });
-
-      const remoteEntry = getClassEntry(saved.selectedClassKey);
-      const previousEntry = getClassEntry(previousSelected);
-      selectedClassKey = remoteEntry
-        ? remoteEntry.key
-        : (previousEntry?.key || getClassEntries()[0]?.key || "");
-      const selected = getClassEntry();
-      if (selected) {
-        useGameState(gameStates[selected.key] || buildGameStateForClass(selected));
-      }
-      renderClassSelect();
-      render();
-      renderGameScreen();
-      showHomeScreen();
-      setStatus(event.detail?.collection === "preferences"
-        ? "synchronized class loaded"
-        : "synchronized game data loaded");
-    }
-
-    window.addEventListener(
-      window.TeamGamesStorage.changeEvent,
-      applyRemoteTeamGamesState
-    );
-
-    const appRoot = document.querySelector(".app");
-    const beginTransientCentralAction = () => {
-      beginCentralAction();
-      window.setTimeout(endCentralAction, 0);
-    };
-    appRoot.addEventListener("pointerdown", (event) => {
-      if (event.target.closest("button, input, select")) {
-        beginTransientCentralAction();
-      }
-    }, true);
-    appRoot.addEventListener("keydown", (event) => {
-      if ((event.key === "Enter" || event.key === " ") &&
-          event.target.closest("button, input, select")) {
-        beginTransientCentralAction();
-      }
-    }, true);
-    appRoot.addEventListener("focusin", refreshCentralInteraction);
-    appRoot.addEventListener("focusout", () => {
-      window.setTimeout(refreshCentralInteraction, 0);
-    });
-    appRoot.addEventListener("input", refreshCentralInteraction);
-    appRoot.addEventListener("change", () => {
-      window.setTimeout(refreshCentralInteraction, 0);
-    });
-
     addStudentButton.addEventListener("click", () => {
       const added = addStudent(studentName.value, studentRating.value);
       studentName.value = "";
@@ -3018,16 +2889,6 @@
     window.addEventListener("student-shuffle-roster-authenticated", () => {
       void loadSharedClassData({ announce: true });
     });
-    refreshCentralInteraction();
   </script>
-  <script src="semantic-app-sync.js"></script>
-  <script>
-    window.SemanticAppSync.install({
-      appId: "team-games",
-      appName: "Team Games",
-      storage: window.TeamGamesStorage
-    });
-  </script>
-  <script src="transfer-theme.js"></script>
 </body>
 </html>

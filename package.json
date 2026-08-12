@@ -4,6 +4,6 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --check transfer-theme.js && node --check semantic-app-sync.js && node --check worker/index.js && node --test tests/transfer-theme.test.cjs tests/icon-metadata.test.cjs && npm run build"
+    "test": "node --check team-games-storage.js && node --check worker/index.js && node --test tests/team-games-storage.test.cjs tests/private-sync-retirement.test.cjs tests/icon-metadata.test.cjs && npm run build"
   }
 }

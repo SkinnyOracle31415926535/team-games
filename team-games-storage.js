@@ -2,9 +2,7 @@
   'use strict';
 
   const APP_ID = 'team-games';
-  const SCHEMA_VERSION = 1;
   const LOCAL_STATE_VERSION = 2;
-  const CHANGE_EVENT = 'team-games:persistent-state-change';
   const AGGREGATE_LOCK = 'team-games:central-state-v1';
   const STORAGE_KEYS = Object.freeze({
     state: 'camp-group-randomizer-v1',
@@ -14,30 +12,20 @@
     STORAGE_KEYS.state,
     STORAGE_KEYS.selectedClass,
   ]);
-  const MAX_RECORD_BYTES = 128 * 1024;
   const MAX_LOCAL_STATE_BYTES = 8 * 1024 * 1024;
   const MAX_RAW_BACKUP_VALUE_BYTES = 16 * 1024 * 1024;
-  const mutationState = {
-    issuedGeneration: 0,
-    pending: [],
-    inFlightGeneration: 0,
-    draining: false,
-    editorActive: false,
-    editorDirty: false,
-    editorWaiters: new Set(),
-  };
   let storageWarning = '';
   let seedState = null;
-  let handles = null;
+  let fallbackQueue = Promise.resolve();
 
   const withAggregateLock = (task) => {
     const locks = window.navigator && window.navigator.locks;
-    if (!locks || typeof locks.request !== 'function') {
-      return Promise.reject(
-        new Error('Shared browser locking is unavailable. Team Games data was not changed.')
-      );
+    if (locks && typeof locks.request === 'function') {
+      return locks.request(AGGREGATE_LOCK, { mode: 'exclusive' }, task);
     }
-    return locks.request(AGGREGATE_LOCK, { mode: 'exclusive' }, task);
+    const result = fallbackQueue.then(task, task);
+    fallbackQueue = result.catch(() => {});
+    return result;
   };
 
   const dataObjectDescriptors = (value) => {
@@ -303,30 +291,6 @@
     return new Set(allIds).size === allIds.length;
   };
 
-  const validatePreferences = (candidate) => {
-    if (!exactKeys(candidate, ['version', 'selectedClassKey']) ||
-        jsonBytes(candidate) > MAX_RECORD_BYTES) {
-      return false;
-    }
-    const value = Object.fromEntries(safeEntries(candidate));
-    return value.version === SCHEMA_VERSION &&
-      validClassKey(value.selectedClassKey, { allowEmpty: true });
-  };
-
-  const validateGameRecord = (
-    candidate,
-    recordId = `game-${'0'.repeat(64)}`,
-  ) => {
-    if (!/^game-[a-f0-9]{64}$/.test(recordId || '') ||
-        !exactKeys(candidate, ['version', 'classKey', 'state'])) {
-      return false;
-    }
-    const value = Object.fromEntries(safeEntries(candidate));
-    return value.version === SCHEMA_VERSION &&
-      validClassKey(value.classKey) && validateGameState(value.state) &&
-      jsonBytes(candidate) <= MAX_RECORD_BYTES;
-  };
-
   const validateState = (candidate) => {
     if (!exactKeys(candidate, ['version', 'selectedClassKey', 'gameStates'])) {
       return false;
@@ -339,55 +303,11 @@
       return false;
     }
     return entries.every(([classKey, gameState]) =>
-      validClassKey(classKey) &&
-      validateGameRecord({
-        version: SCHEMA_VERSION,
-        classKey,
-        state: gameState,
-      })) && jsonBytes(candidate) <= MAX_LOCAL_STATE_BYTES;
+      validClassKey(classKey) && validateGameState(gameState)) &&
+      jsonBytes(candidate) <= MAX_LOCAL_STATE_BYTES;
   };
 
   const canonicalState = (candidate) => cloneJson(candidate);
-  const canonicalPreferences = (candidate) => cloneJson(candidate);
-  const canonicalGameRecord = (candidate) => cloneJson(candidate);
-
-  const sha256 = async (value) => {
-    if (!window.crypto || !window.crypto.subtle) {
-      throw new Error('Secure hashing is required to synchronize Team Games records.');
-    }
-    const digest = await window.crypto.subtle.digest(
-      'SHA-256',
-      new TextEncoder().encode(value),
-    );
-    return Array.from(new Uint8Array(digest), (byte) =>
-      byte.toString(16).padStart(2, '0')).join('');
-  };
-
-  const gameRecordId = async (classKey) => {
-    if (!validClassKey(classKey)) throw new Error('The Team Games class key is invalid.');
-    return `game-${await sha256(classKey)}`;
-  };
-
-  const identifyGames = async (gameStates) => {
-    const entries = safeEntries(gameStates);
-    if (!entries) throw new Error('The Team Games class states are invalid.');
-    const records = await Promise.all(entries.map(async ([classKey, state]) => {
-      const recordId = await gameRecordId(classKey);
-      const value = {
-        version: SCHEMA_VERSION,
-        classKey,
-        state: cloneJson(state),
-      };
-      if (!validateGameRecord(value, recordId)) {
-        throw new Error(`The saved Team Games state for ${classKey} is invalid.`);
-      }
-      return { sourceId: classKey, recordId, value };
-    }));
-    if (new Set(records.map(({ recordId }) => recordId)).size !== records.length) {
-      throw new Error('Local Team Games class identities collide and need review.');
-    }
-    return records;
-  };
 
   const captureRaw = () => RAW_BACKUP_KEYS.map((key) => ({
     key,
@@ -476,357 +396,17 @@
 
   const readStateUnlocked = () => readStateFromSnapshot(captureRaw());
 
-  const baseStateForWrite = (snapshot) => {
-    const current = readStateFromSnapshot(snapshot);
-    if (current) return current;
-    if (!seedState || !validateState(seedState)) {
-      throw new Error('Team Games defaults are unavailable. Local data was not changed.');
-    }
-    return canonicalState(seedState);
-  };
-
-  const dispatchChange = (collection, source, classKey = '') => {
-    window.dispatchEvent(new CustomEvent(CHANGE_EVENT, {
-      detail: { collection, source, classKey },
-    }));
-  };
-
-  const localWorkPending = () =>
-    Boolean(mutationState.pending.length || mutationState.inFlightGeneration);
-
-  const assertConsistentRead = () => {
-    if (localWorkPending() || mutationState.editorActive || mutationState.editorDirty) {
-      throw new Error(
-        'Local Team Games actions must settle before synchronization can read them.'
-      );
-    }
-  };
-
-  const wakeEditorWaiters = () => {
-    if (mutationState.editorActive || mutationState.editorDirty) return;
-    for (const resolve of mutationState.editorWaiters) resolve();
-    mutationState.editorWaiters.clear();
-  };
-
-  const waitForEditorIdle = () => {
-    if (!mutationState.editorActive && !mutationState.editorDirty) return Promise.resolve();
-    return new Promise((resolve) => mutationState.editorWaiters.add(resolve));
-  };
-
-  const assertRemoteWritable = (generation) => {
-    if (mutationState.issuedGeneration !== generation || localWorkPending() ||
-        mutationState.editorActive || mutationState.editorDirty) {
-      throw new Error(
-        'Remote Team Games data was not applied because a newer local action needs review.'
-      );
-    }
-  };
-
-  const withConsistentRead = (task) => withAggregateLock(() => {
-    assertConsistentRead();
-    return task();
-  });
-
-  const withRemoteWrite = async (task) => {
-    const generation = mutationState.issuedGeneration;
-    if (localWorkPending()) {
-      throw new Error('Remote Team Games data was not applied because local work is pending.');
-    }
-    await waitForEditorIdle();
-    assertRemoteWritable(generation);
-    return withAggregateLock(async () => {
-      assertRemoteWritable(generation);
-      return task(() => assertRemoteWritable(generation));
-    });
-  };
-
-  const enqueueLatest = (perform) => {
-    const generation = ++mutationState.issuedGeneration;
-    const promise = new Promise((resolve, reject) => {
-      const pending = mutationState.pending[0];
-      if (!pending) {
-        mutationState.pending.push({
-          generation,
-          perform,
-          waiters: [{ resolve, reject }],
-        });
-      } else {
-        pending.generation = generation;
-        pending.perform = perform;
-        pending.waiters.push({ resolve, reject });
-      }
-    });
-    if (!mutationState.draining) {
-      mutationState.draining = true;
-      Promise.resolve().then(async () => {
-        try {
-          while (mutationState.pending.length) {
-            const job = mutationState.pending.shift();
-            mutationState.inFlightGeneration = job.generation;
-            try {
-              const result = await job.perform(job.generation);
-              job.waiters.forEach(({ resolve }) => resolve(result));
-            } catch (error) {
-              job.waiters.forEach(({ reject }) => reject(error));
-            } finally {
-              mutationState.inFlightGeneration = 0;
-            }
-          }
-        } finally {
-          mutationState.draining = false;
-        }
-      });
-    }
-    return promise;
-  };
-
-  const setEditorState = (update) => {
-    if (!plainObject(update)) throw new Error('The Team Games editor state is invalid.');
-    const value = Object.fromEntries(safeEntries(update));
-    if (Object.prototype.hasOwnProperty.call(value, 'active')) {
-      if (typeof value.active !== 'boolean') {
-        throw new Error('The Team Games editor state is invalid.');
-      }
-      mutationState.editorActive = value.active;
-    }
-    if (Object.prototype.hasOwnProperty.call(value, 'dirty')) {
-      if (typeof value.dirty !== 'boolean') {
-        throw new Error('The Team Games editor state is invalid.');
-      }
-      mutationState.editorDirty = value.dirty;
-    }
-    wakeEditorWaiters();
-  };
-
-  const writeFullStateUnlocked = (
-    candidate,
-    source,
-    assertCurrent = () => {},
-    collection = 'state',
-    classKey = '',
-  ) => {
+  const writeFullStateUnlocked = (candidate) => {
     if (!validateState(candidate)) throw new Error('The Team Games app state is invalid.');
     const value = canonicalState(candidate);
     const snapshot = captureRaw();
-    const previous = readStateFromSnapshot(snapshot);
-    assertCurrent();
+    readStateFromSnapshot(snapshot);
     compareAndSet(snapshot, [
       { key: STORAGE_KEYS.state, raw: JSON.stringify(value) },
       { key: STORAGE_KEYS.selectedClass, raw: value.selectedClassKey },
     ], 'Team Games app data');
     storageWarning = '';
-    dispatchChange(collection, source, classKey);
-    return previous;
-  };
-
-  const applyPreferencesUnlocked = (candidate, source, assertCurrent = () => {}) => {
-    if (!validatePreferences(candidate)) {
-      throw new Error('The synchronized Team Games preferences are invalid.');
-    }
-    const value = canonicalPreferences(candidate);
-    const snapshot = captureRaw();
-    const current = baseStateForWrite(snapshot);
-    current.selectedClassKey = value.selectedClassKey;
-    assertCurrent();
-    compareAndSet(snapshot, [
-      { key: STORAGE_KEYS.state, raw: JSON.stringify(current) },
-      { key: STORAGE_KEYS.selectedClass, raw: current.selectedClassKey },
-    ], 'Team Games selected class');
-    storageWarning = '';
-    dispatchChange('preferences', source);
     return true;
-  };
-
-  const listGamesUnlocked = async () => {
-    const snapshot = captureRaw();
-    const current = readStateFromSnapshot(snapshot);
-    if (!current) return [];
-    const records = await identifyGames(current.gameStates);
-    assertRawUnchanged(snapshot, 'Team Games class states');
-    return records.map(({ recordId, value }) => ({ recordId, value }));
-  };
-
-  const applyGameUnlocked = async (
-    recordId,
-    candidate,
-    deleted,
-    source,
-    assertCurrent = () => {},
-  ) => {
-    if (!/^game-[a-f0-9]{64}$/.test(recordId || '')) {
-      throw new Error('The synchronized Team Games game-state ID is invalid.');
-    }
-    const snapshot = captureRaw();
-    const current = baseStateForWrite(snapshot);
-    const identified = await identifyGames(current.gameStates);
-    assertRawUnchanged(snapshot, 'Team Games class states');
-    const matches = identified.filter((item) => item.recordId === recordId);
-    if (matches.length > 1) {
-      throw new Error('Local Team Games class identities collide and need review.');
-    }
-    let changedClassKey = matches[0]?.sourceId || '';
-    if (deleted) {
-      if (!matches.length) {
-        assertCurrent();
-        assertRawUnchanged(snapshot, 'Team Games class states');
-        return true;
-      }
-      delete current.gameStates[matches[0].sourceId];
-    } else {
-      if (!validateGameRecord(candidate, recordId)) {
-        throw new Error('The synchronized Team Games game state is invalid.');
-      }
-      const value = canonicalGameRecord(candidate);
-      if (await gameRecordId(value.classKey) !== recordId) {
-        throw new Error('The synchronized Team Games class identity does not match its record.');
-      }
-      if (matches.length && matches[0].sourceId !== value.classKey) {
-        throw new Error('The synchronized Team Games class identity collides with local data.');
-      }
-      current.gameStates[value.classKey] = value.state;
-      changedClassKey = value.classKey;
-    }
-    if (!validateState(current)) {
-      throw new Error('The synchronized game state would make local Team Games data invalid.');
-    }
-    assertCurrent();
-    compareAndSet(snapshot, [
-      { key: STORAGE_KEYS.state, raw: JSON.stringify(current) },
-      { key: STORAGE_KEYS.selectedClass, raw: current.selectedClassKey },
-    ], 'Team Games class state');
-    storageWarning = '';
-    dispatchChange('game-states', source, changedClassKey);
-    return true;
-  };
-
-  const requireWriteSource = (metadata) => {
-    if (!metadata || !['local', 'remote-migration'].includes(metadata.source)) {
-      throw new Error('The sync client requested an invalid local write source.');
-    }
-  };
-
-  const requireRemoteSource = (metadata) => {
-    if (!metadata || !['remote', 'migration'].includes(metadata.source)) {
-      throw new Error('The sync client requested an invalid remote write source.');
-    }
-  };
-
-  const rejectFixedTombstone = (metadata, label) => {
-    if (metadata && metadata.deleted) {
-      throw new Error(`${label} is a fixed record and cannot be deleted.`);
-    }
-  };
-
-  const localOrMigratedWrite = (metadata, task) => {
-    requireWriteSource(metadata);
-    return metadata.source === 'remote-migration'
-      ? withRemoteWrite(task)
-      : withAggregateLock(() => task(() => {}));
-  };
-
-  const readPreferencesUnlocked = () => {
-    const current = readStateUnlocked();
-    return current ? {
-      version: SCHEMA_VERSION,
-      selectedClassKey: current.selectedClassKey,
-    } : undefined;
-  };
-
-  const makeAdapters = () => ({
-    preferences: {
-      scope: APP_ID,
-      appId: APP_ID,
-      collection: 'preferences',
-      recordId: 'current',
-      schemaVersion: SCHEMA_VERSION,
-      validate: validatePreferences,
-      readLocal: () => withConsistentRead(readPreferencesUnlocked),
-      writeLocal: (value, metadata) => {
-        rejectFixedTombstone(metadata, 'Team Games preferences');
-        return localOrMigratedWrite(metadata, (assertCurrent) =>
-          applyPreferencesUnlocked(value, metadata.source, assertCurrent));
-      },
-      applyRemote: (value, metadata) => {
-        requireRemoteSource(metadata);
-        rejectFixedTombstone(metadata, 'Team Games preferences');
-        return withRemoteWrite((assertCurrent) =>
-          applyPreferencesUnlocked(value, metadata.source, assertCurrent));
-      },
-    },
-    gameStates: {
-      scope: APP_ID,
-      appId: APP_ID,
-      collection: 'game-states',
-      schemaVersion: SCHEMA_VERSION,
-      validate: validateGameRecord,
-      listLocal: () => withConsistentRead(listGamesUnlocked),
-      writeLocal: (recordId, value, metadata) =>
-        localOrMigratedWrite(metadata, (assertCurrent) =>
-          applyGameUnlocked(
-            recordId,
-            value,
-            Boolean(metadata.deleted),
-            metadata.source,
-            assertCurrent,
-          )),
-      applyRemote: (recordId, value, metadata) => {
-        requireRemoteSource(metadata);
-        return withRemoteWrite((assertCurrent) =>
-          applyGameUnlocked(
-            recordId,
-            value,
-            Boolean(metadata.deleted),
-            metadata.source,
-            assertCurrent,
-          ));
-      },
-    },
-  });
-
-  const attachHandles = (next) => {
-    if (!exactKeys(next, ['preferences', 'gameStates'])) {
-      throw new Error('Team Games sync handles are incomplete.');
-    }
-    const value = Object.fromEntries(safeEntries(next));
-    if (!value.preferences || typeof value.preferences.save !== 'function' ||
-        !value.gameStates || typeof value.gameStates.save !== 'function' ||
-        typeof value.gameStates.remove !== 'function') {
-      throw new Error('Team Games sync handles are incomplete.');
-    }
-    handles = Object.freeze({ ...value });
-  };
-
-  const sameValue = (left, right) => JSON.stringify(left) === JSON.stringify(right);
-
-  const stageStateChanges = async (previous, current) => {
-    if (!handles) return;
-    const oldPreference = previous ? {
-      version: SCHEMA_VERSION,
-      selectedClassKey: previous.selectedClassKey,
-    } : undefined;
-    const newPreference = {
-      version: SCHEMA_VERSION,
-      selectedClassKey: current.selectedClassKey,
-    };
-    if (!oldPreference || !sameValue(oldPreference, newPreference)) {
-      await handles.preferences.save(newPreference);
-    }
-
-    const oldGames = previous ? await identifyGames(previous.gameStates) : [];
-    const newGames = await identifyGames(current.gameStates);
-    const oldById = new Map(oldGames.map((item) => [item.recordId, item]));
-    const newById = new Map(newGames.map((item) => [item.recordId, item]));
-    for (const item of newGames) {
-      if (!oldById.has(item.recordId) ||
-          !sameValue(oldById.get(item.recordId).value, item.value)) {
-        await handles.gameStates.save(item.recordId, item.value);
-      }
-    }
-    for (const item of oldGames) {
-      if (!newById.has(item.recordId)) {
-        await handles.gameStates.remove(item.recordId);
-      }
-    }
   };
 
   const saveState = (candidate) => {
@@ -834,12 +414,7 @@
       return Promise.reject(new Error('The Team Games app state is invalid.'));
     }
     const value = canonicalState(candidate);
-    return enqueueLatest(async () => {
-      const previous = await withAggregateLock(() =>
-        writeFullStateUnlocked(value, 'local'));
-      await stageStateChanges(previous, value);
-      return true;
-    });
+    return withAggregateLock(() => writeFullStateUnlocked(value));
   };
 
   const loadState = (fallback) => {
@@ -894,19 +469,10 @@
 
   window.TeamGamesStorage = Object.freeze({
     appId: APP_ID,
-    schemaVersion: SCHEMA_VERSION,
-    changeEvent: CHANGE_EVENT,
-    aggregateLock: AGGREGATE_LOCK,
     storageKeys: STORAGE_KEYS,
     rawBackupKeys: RAW_BACKUP_KEYS,
     rawBackup,
     validateState,
-    validatePreferences,
-    validateGameRecord,
-    gameRecordId,
-    makeAdapters,
-    attachHandles,
-    setEditorState,
     saveState,
     loadState,
     loadSelectedClassKey,
